@@ -3,6 +3,7 @@ import fitz
 import img2pdf
 import io
 import re
+import argparse
 from tqdm import tqdm
 import torch
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +15,7 @@ os.environ['VLLM_USE_V1'] = '0'
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
 
-from config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, SKIP_REPEAT, MAX_CONCURRENCY, NUM_WORKERS, CROP_MODE
+from config import MODEL_PATH, SKIP_REPEAT, MAX_CONCURRENCY, NUM_WORKERS, CROP_MODE
 
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
@@ -47,7 +48,7 @@ logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=20, window_size=50,
 
 sampling_params = SamplingParams(
     temperature=0.0,
-    max_tokens=8192,
+    max_tokens=4096,  # Reduced from 8192 to avoid timeouts on complex pages
     logits_processors=logits_processors,
     skip_special_tokens=False,
     include_stop_str_in_output=True,
@@ -148,7 +149,7 @@ def extract_coordinates_and_label(ref_text, image_width, image_height):
     return (label_type, cor_list)
 
 
-def draw_bounding_boxes(image, refs, jdx):
+def draw_bounding_boxes(image, refs, jdx, output_path):
 
     image_width, image_height = image.size
     img_draw = image.copy()
@@ -183,7 +184,7 @@ def draw_bounding_boxes(image, refs, jdx):
                     if label_type == 'image':
                         try:
                             cropped = image.crop((x1, y1, x2, y2))
-                            cropped.save(f"{OUTPUT_PATH}/images/{jdx}_{img_idx}.jpg")
+                            cropped.save(f"{output_path}/images/{jdx}_{img_idx}.jpg")
                         except Exception as e:
                             print(e)
                             pass
@@ -215,8 +216,8 @@ def draw_bounding_boxes(image, refs, jdx):
     return img_draw
 
 
-def process_image_with_refs(image, ref_texts, jdx):
-    result_image = draw_bounding_boxes(image, ref_texts, jdx)
+def process_image_with_refs(image, ref_texts, jdx, output_path):
+    result_image = draw_bounding_boxes(image, ref_texts, jdx, output_path)
     return result_image
 
 
@@ -231,6 +232,17 @@ def process_single_image(image):
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='DeepSeek OCR PDF Processing')
+    parser.add_argument('--input_path', type=str, required=True, help='Input PDF file path')
+    parser.add_argument('--output_path', type=str, required=True, help='Output directory path')
+    parser.add_argument('--prompt', type=str, default='<image>\n<|grounding|>Convert the document to markdown.', help='OCR prompt')
+    
+    args = parser.parse_args()
+    
+    INPUT_PATH = args.input_path
+    OUTPUT_PATH = args.output_path
+    PROMPT = args.prompt
 
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     os.makedirs(f'{OUTPUT_PATH}/images', exist_ok=True)
@@ -265,10 +277,13 @@ if __name__ == "__main__":
     #     batch_inputs.extend(cache_list)
 
 
-    outputs_list = llm.generate(
-        batch_inputs,
-        sampling_params=sampling_params
-    )
+    # Process in smaller batches to avoid timeout
+    batch_size = 1  # Reduced from 5 to avoid timeouts on complex pages
+    outputs_list = []
+    for i in range(0, len(batch_inputs), batch_size):
+        sub_batch = batch_inputs[i:i + batch_size]
+        sub_outputs = llm.generate(sub_batch, sampling_params)
+        outputs_list.extend(sub_outputs)
 
 
     output_path = OUTPUT_PATH
@@ -301,7 +316,7 @@ if __name__ == "__main__":
 
         matches_ref, matches_images, mathes_other = re_match(content)
         # print(matches_ref)
-        result_image = process_image_with_refs(image_draw, matches_ref, jdx)
+        result_image = process_image_with_refs(image_draw, matches_ref, jdx, OUTPUT_PATH)
 
 
         draw_images.append(result_image)

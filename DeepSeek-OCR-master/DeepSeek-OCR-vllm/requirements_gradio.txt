@@ -1,0 +1,4 @@
+# Gradio Web Application Requirements for DeepSeek-OCR
+gradio>=4.0.0
+PyMuPDF>=1.23.0
+img2pdf>=0.5.0
