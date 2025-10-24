@@ -3,12 +3,64 @@ import re
 import io
 import asyncio
 import zipfile
+import gc
+import torch
+import base64
 from typing import Optional, List, Tuple, Iterator
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 import numpy as np
 import gradio as gr
-import torch
 import fitz  # PyMuPDF
+
+def clear_gpu_memory():
+    """Aggressively clear GPU memory"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        gc.collect()
+
+def check_gpu_memory(threshold=0.75):
+    """Check GPU memory usage and return pressure level"""
+    if torch.cuda.is_available():
+        memory_allocated = torch.cuda.memory_allocated()
+        memory_reserved = torch.cuda.memory_reserved()
+        memory_total = torch.cuda.get_device_properties(0).total_memory
+        
+        allocated_gb = memory_allocated / 1024**3
+        reserved_gb = memory_reserved / 1024**3
+        total_gb = memory_total / 1024**3
+        
+        usage_ratio = allocated_gb / total_gb
+        
+        print(f"GPU Memory - Allocated: {allocated_gb:.2f}GB, Reserved: {reserved_gb:.2f}GB, Total: {total_gb:.2f}GB (Usage: {usage_ratio*100:.1f}%)")
+        
+        if usage_ratio > threshold:
+            print(f"WARNING: High GPU memory usage ({usage_ratio*100:.1f}%), clearing cache...")
+            clear_gpu_memory()
+            memory_pressure['high_pressure_count'] += 1
+            return False
+        else:
+            memory_pressure['high_pressure_count'] = max(0, memory_pressure['high_pressure_count'] - 1)
+    return True
+
+
+def check_system_memory():
+    """Check system RAM usage and warn if critical"""
+    try:
+        import psutil
+        memory = psutil.virtual_memory()
+        memory_percent = memory.percent
+        
+        if memory_percent > 90:
+            print(f"⚠️ CRITICAL: System RAM usage at {memory_percent}% - risk of OOM kill!")
+            return False
+        elif memory_percent > 80:
+            print(f"⚠️ WARNING: System RAM usage at {memory_percent}% - approaching limits")
+            return True
+        return True
+    except ImportError:
+        # psutil not available, can't check
+        return True
 
 if torch.version.cuda == '11.8':
     os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
@@ -28,16 +80,54 @@ from config import MODEL_PATH, IMAGE_SIZE, BASE_SIZE, CROP_MODE
 # Register the model
 ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
 
+# Load and encode app icon as base64 data URI
+def load_app_icon():
+    """Load app icon and convert to base64 data URI"""
+    icon_path = os.path.join(os.path.dirname(__file__), "app-icon.png")
+    if os.path.exists(icon_path):
+        try:
+            with open(icon_path, "rb") as f:
+                icon_data = base64.b64encode(f.read()).decode()
+                return f"data:image/png;base64,{icon_data}"
+        except Exception as e:
+            print(f"Failed to load app icon: {e}")
+    return ""
+
+APP_ICON_DATA_URI = load_app_icon()
+
 # Global variable to store the engine
 engine = None
 
 # Global cancellation flag for PDF processing
 pdf_processing_cancelled = False
 
+# Track engine health status
+engine_health_status = {
+    'last_error': None,
+    'consecutive_errors': 0,
+    'last_successful_generation': None,
+    'requires_restart': False
+}
+
+# Memory pressure tracking
+memory_pressure = {
+    'high_pressure_count': 0,
+    'reduced_batch_size': False
+}
+
+# Track processing state for partial results
+processing_state = {
+    'completed_files': [],
+    'failed_pages': [],
+    'current_chunk': 0,
+    'total_chunks': 0,
+    'processing_active': False
+}
+
 # Language translations
 TRANSLATIONS = {
     "en": {
-        "title": "🔍 DeepSeek-OCR vLLM Web Application",
+        "title": f'<div style="display: flex; align-items: center; gap: 12px;"><img src="{APP_ICON_DATA_URI}" style="width: 40px; height: 40px; border-radius: 50%;"><h1 style="margin: 0; font-size: 2em; font-weight: 600;">DeepSeek-OCR vLLM Web Application</h1></div>',
         "subtitle": "Upload images or PDFs to extract text and document structure using DeepSeek-OCR.",
         "image_ocr_tab": "Image OCR",
         "pdf_ocr_tab": "PDF OCR",
@@ -113,7 +203,7 @@ For more information, visit the [DeepSeek-OCR repository](https://github.com/dee
 """,
     },
     "zh": {
-        "title": "🔍 DeepSeek-OCR vLLM 黄哥写书",
+        "title": f'<div style="display: flex; align-items: center; gap: 12px;"><img src="{APP_ICON_DATA_URI}" style="width: 40px; height: 40px; border-radius: 50%;"><h1 style="margin: 0; font-size: 2em; font-weight: 600;">DeepSeek-OCR vLLM 黄哥写书</h1></div>',
         "subtitle": "上传图片或PDF文档，使用DeepSeek-OCR提取文本和文档结构。",
         "image_ocr_tab": "图片OCR",
         "pdf_ocr_tab": "PDF OCR",
@@ -298,6 +388,105 @@ def iter_pdf_images(pdf_path: str, dpi: int = 144, start_page: int = 0, end_page
         doc.close()
 
 
+def format_as_markdown(text, page_num=None, doc_title=None):
+    """Format OCR output as proper markdown with structure"""
+    if not text or text.strip() == "":
+        return text
+    
+    # Clean the text first
+    matches_ref, matches_images, matches_other = re_match(text)
+    clean_text = text
+    for match in matches_images + matches_other:
+        clean_text = clean_text.replace(match, '')
+    clean_text = clean_text.replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
+    
+    # Remove existing page headers (--- Page X ---)
+    clean_text = re.sub(r'^---\s*Page\s+\d+\s*---\s*\n?', '', clean_text, flags=re.MULTILINE)
+    
+    # Split into lines and process
+    lines = clean_text.strip().split('\n')
+    formatted_lines = []
+    
+    # Add page header if specified
+    if page_num is not None:
+        formatted_lines.append(f"# Page {page_num}")
+        if doc_title:
+            formatted_lines.append(f"*From: {doc_title}*")
+        formatted_lines.append("")
+    
+    # Process each line
+    current_paragraph = []
+    in_list = False
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Skip empty lines but preserve paragraph breaks
+        if not line:
+            if current_paragraph:
+                formatted_lines.append(' '.join(current_paragraph))
+                current_paragraph = []
+            if not in_list:
+                formatted_lines.append("")
+            continue
+        
+        # Skip remaining page markers
+        if re.match(r'^---\s*Page\s+\d+\s*---\s*$', line):
+            continue
+        
+        # Detect headers (lines that are likely titles)
+        if (
+            len(line) < 120 and 
+            not line.endswith(('.', ',', ';', ':', '!', '?')) and
+            not line.startswith(('•', '-', '*', '1.', '2.', '3.', '4.', '5.')) and
+            (line.isupper() or 
+             any(char in line for char in ['第', '章', 'Chapter', 'Section', '序言']) or
+             re.match(r'^\d+[\.\s]', line) or
+             (len(line.split()) <= 10 and '：' not in line and '(' not in line))
+        ):
+            # Finish current paragraph
+            if current_paragraph:
+                formatted_lines.append(' '.join(current_paragraph))
+                current_paragraph = []
+            
+            # Add header
+            formatted_lines.append("")
+            formatted_lines.append(f"## {line}")
+            formatted_lines.append("")
+            in_list = False
+            continue
+        
+        # Detect lists
+        if line.startswith(('•', '-', '*', '・')):
+            if current_paragraph:
+                formatted_lines.append(' '.join(current_paragraph))
+                current_paragraph = []
+            formatted_lines.append(f"- {line[1:].strip()}")
+            in_list = True
+            continue
+        elif re.match(r'^\d+[\.\)\s]', line):
+            if current_paragraph:
+                formatted_lines.append(' '.join(current_paragraph))
+                current_paragraph = []
+            match = re.match(r'^(\d+)[\.\)\s](.*)', line)
+            if match:
+                formatted_lines.append(f"{match.group(1)}. {match.group(2).strip()}")
+            else:
+                formatted_lines.append(f"- {line}")
+            in_list = True
+            continue
+        
+        # Regular text - accumulate into paragraph
+        in_list = False
+        current_paragraph.append(line)
+    
+    # Add final paragraph
+    if current_paragraph:
+        formatted_lines.append(' '.join(current_paragraph))
+    
+    return '\n'.join(formatted_lines)
+
+
 def re_match(text):
     """Extract reference patterns from text"""
     pattern = r'(<\|ref\|>(.*?)<\|/ref\|><\|det\|>(.*?)<\|/det\|>)'
@@ -378,29 +567,67 @@ def draw_bounding_boxes(image, refs):
     return img_draw
 
 
-async def initialize_engine():
-    """Initialize the AsyncLLMEngine"""
-    global engine
+async def initialize_engine(force_restart=False):
+    """Initialize the AsyncLLMEngine with optional force restart"""
+    global engine, engine_health_status
+    
+    if force_restart and engine is not None:
+        print("[ENGINE] Force restarting engine due to errors...")
+        try:
+            # Try to gracefully shutdown the engine
+            if hasattr(engine, 'shutdown'):
+                await engine.shutdown()
+        except Exception as e:
+            print(f"[ENGINE] Error during engine shutdown: {e}")
+        
+        engine = None
+        # Force CUDA cleanup
+        clear_gpu_memory()
+        await asyncio.sleep(2)  # Give time for cleanup
+    
     if engine is None:
-        engine_args = AsyncEngineArgs(
-            model=MODEL_PATH,
-            hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
-            block_size=256,
-            max_model_len=8192,
-            enforce_eager=False,
-            trust_remote_code=True,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=0.75,
-        )
-        engine = AsyncLLMEngine.from_engine_args(engine_args)
+        print("[ENGINE] Initializing new AsyncLLMEngine...")
+        try:
+            engine_args = AsyncEngineArgs(
+                model=MODEL_PATH,
+                hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
+                block_size=256,
+                max_model_len=8192,
+                enforce_eager=True,  # Disable CUDA graphs to prevent capture errors
+                trust_remote_code=True,
+                tensor_parallel_size=1,
+                gpu_memory_utilization=0.35,  # Further reduced from 0.4 to 0.35 for stability
+                max_num_seqs=16,  # Further reduced from 32 to prevent timeout
+                enable_chunked_prefill=True,  # Enable memory optimization
+                max_num_batched_tokens=1536,  # Reduced from 2048 for better stability
+            )
+            engine = AsyncLLMEngine.from_engine_args(engine_args)
+            
+            # Reset health status on successful init
+            engine_health_status['consecutive_errors'] = 0
+            engine_health_status['requires_restart'] = False
+            engine_health_status['last_error'] = None
+            
+            print("[ENGINE] Engine initialized successfully")
+        except Exception as e:
+            print(f"[ENGINE] CRITICAL: Failed to initialize engine: {e}")
+            raise
+    
     return engine
 
 
-async def generate_ocr_result(image_features, prompt: str, progress=gr.Progress()):
-    """Generate OCR result using the model"""
-    global engine
+async def generate_ocr_result(image_features, prompt: str, progress=gr.Progress(), timeout=300, retry_count=2):
+    """Generate OCR result using the model with retry and error recovery"""
+    global engine, engine_health_status
     
-    if engine is None:
+    # Check if engine needs restart
+    if engine_health_status.get('requires_restart', False) or engine_health_status.get('consecutive_errors', 0) >= 3:
+        print("[ENGINE] Engine unhealthy, forcing restart...")
+        try:
+            await initialize_engine(force_restart=True)
+        except Exception as e:
+            return f"Error: Failed to restart engine: {str(e)}"
+    elif engine is None:
         await initialize_engine()
     
     logits_processors = [NoRepeatNGramLogitsProcessor(
@@ -409,12 +636,10 @@ async def generate_ocr_result(image_features, prompt: str, progress=gr.Progress(
     
     sampling_params = SamplingParams(
         temperature=0.0,
-        max_tokens=4096,  # Reduced from 8192 to speed up processing and avoid timeouts
+        max_tokens=1024,  # Further reduced from 2048 to prevent CUDA OOM
         logits_processors=logits_processors,
         skip_special_tokens=False,
     )
-    
-    request_id = f"request-{os.urandom(16).hex()}"
     
     if image_features and '<image>' in prompt:
         request = {
@@ -428,18 +653,79 @@ async def generate_ocr_result(image_features, prompt: str, progress=gr.Progress(
     else:
         return "Error: No prompt provided!"
     
-    try:
-        full_text = ""
-        async for request_output in engine.generate(request, sampling_params, request_id):
-            if request_output.outputs:
-                full_text = request_output.outputs[0].text
+    # Retry logic with exponential backoff
+    for attempt in range(retry_count + 1):
+        request_id = f"request-{os.urandom(16).hex()}"
         
-        return full_text
-    except Exception as e:
-        if "timed out" in str(e).lower() or "timeout" in str(e).lower():
-            return "Error: Processing timed out. Try reducing image complexity or using smaller batch sizes."
-        else:
-            return f"Error during generation: {str(e)}"
+        try:
+            full_text = ""
+            
+            async def generate_with_timeout():
+                async for request_output in engine.generate(request, sampling_params, request_id):
+                    if request_output.outputs:
+                        full_text = request_output.outputs[0].text
+                return full_text
+            
+            # Use asyncio.wait_for to enforce timeout
+            full_text = await asyncio.wait_for(generate_with_timeout(), timeout=timeout)
+            
+            # Success - reset error counters
+            engine_health_status['consecutive_errors'] = 0
+            engine_health_status['last_successful_generation'] = asyncio.get_event_loop().time()
+            engine_health_status['last_error'] = None
+            
+            # Force garbage collection after generation
+            gc.collect()
+            
+            return full_text
+            
+        except asyncio.TimeoutError:
+            error_msg = f"Processing timed out after {timeout}s (attempt {attempt + 1}/{retry_count + 1})"
+            print(f"[ENGINE] {error_msg}")
+            engine_health_status['consecutive_errors'] += 1
+            engine_health_status['last_error'] = 'timeout'
+            
+            if attempt < retry_count:
+                print(f"[ENGINE] Retrying after {2 ** attempt} second delay...")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                # Try engine restart on last retry
+                if attempt == retry_count - 1:
+                    try:
+                        await initialize_engine(force_restart=True)
+                    except Exception as restart_error:
+                        print(f"[ENGINE] Failed to restart: {restart_error}")
+            else:
+                engine_health_status['requires_restart'] = True
+                return f"Error: {error_msg}. Engine marked for restart. Try reducing batch size or image complexity."
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            error_msg = f"Generation error: {str(e)} (attempt {attempt + 1}/{retry_count + 1})"
+            print(f"[ENGINE] {error_msg}")
+            engine_health_status['consecutive_errors'] += 1
+            engine_health_status['last_error'] = str(e)
+            
+            # Check for critical errors that require restart
+            if any(keyword in error_str for keyword in ['dead', 'background loop', 'cuda', 'out of memory', 'oom']):
+                engine_health_status['requires_restart'] = True
+                
+                if attempt < retry_count:
+                    print(f"[ENGINE] Critical error detected, restarting engine...")
+                    try:
+                        await initialize_engine(force_restart=True)
+                        await asyncio.sleep(2)
+                    except Exception as restart_error:
+                        return f"Error: Failed to recover from {error_str}: {restart_error}"
+                else:
+                    return f"Error: {error_msg}. Failed to recover after {retry_count + 1} attempts."
+            else:
+                # Non-critical error, just retry
+                if attempt < retry_count:
+                    await asyncio.sleep(1)
+                else:
+                    return f"Error: {error_msg}"
+    
+    return "Error: Maximum retry attempts exceeded"
 
 
 def process_ocr_image(
@@ -475,17 +761,14 @@ def process_ocr_image(
             image_features = ''
         
         progress(0.5, desc=get_text("running_ocr", lang))
-        result_text = asyncio.run(generate_ocr_result(image_features, prompt_template, progress))
+        result_text = asyncio.run(generate_ocr_result(image_features, prompt_template, progress, timeout=180))
         
         # Process the output
         progress(0.9, desc=get_text("processing_results", lang))
         matches_ref, matches_images, matches_other = re_match(result_text)
         
-        # Clean up the text
-        clean_text = result_text
-        for match in matches_images + matches_other:
-            clean_text = clean_text.replace(match, '')
-        clean_text = clean_text.replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
+        # Format as proper markdown
+        clean_text = format_as_markdown(result_text)
         
         # Draw bounding boxes if requested
         output_image = None
@@ -505,11 +788,21 @@ def process_ocr_pdf(
     use_cropping: bool,
     max_pages: int,
     batch_size: int,
+    chunk_size: int,
     lang: str,
     progress=gr.Progress()
 ):
-    """Process a PDF file for OCR"""
-    global pdf_processing_cancelled
+    """Process a PDF file for OCR with robust chunking and engine restart"""
+    global pdf_processing_cancelled, engine, engine_health_status, processing_state
+    
+    # Initialize processing state
+    processing_state = {
+        'completed_files': [],
+        'failed_pages': [],
+        'current_chunk': 0,
+        'total_chunks': 0,
+        'processing_active': True
+    }
     
     if pdf_file is None:
         return [], get_text("please_upload_pdf", lang)
@@ -521,124 +814,119 @@ def process_ocr_pdf(
         with fitz.open(pdf_file.name) as _doc_probe:
             total_pages = _doc_probe.page_count
 
-        # Respect max_pages selection
+        # Respect max_pages selection - if max_pages is 0, process all pages
         if max_pages and max_pages > 0:
             num_pages = min(max_pages, total_pages)
         else:
             num_pages = total_pages
 
+        print(f"[PDF] Processing {num_pages} pages from PDF with {total_pages} total pages")
+        print(f"[PDF] Using chunk size: {chunk_size}, batch size: {batch_size}")
+
         os.makedirs("output", exist_ok=True)
         base_name = os.path.splitext(os.path.basename(pdf_file.name))[0]
         
-        if num_pages <= 25:
-            # Process as single batch
-            all_results = []
-            effective_batch_size = max(1, min(batch_size, num_pages))
-
-            # Iterate through pages in small chunks to control RAM usage
-            for i in range(0, num_pages, effective_batch_size):
-                if pdf_processing_cancelled:
-                    pdf_processing_cancelled = False
-                    return [], get_text("cancelled", lang)
-                
-                sub_indices = list(range(i, min(i + effective_batch_size, num_pages)))
-                
-                progress((i + len(sub_indices)) / num_pages, desc=f"{get_text('processing_page', lang)} {i + 1}-{min(i + effective_batch_size, num_pages)}/{num_pages}...")
-                
-                try:
-                    # Prepare batch inputs
-                    batch_inputs = []
-                    # Lazily render only the pages in this chunk
-                    sub_images = []
-                    for page_idx, image in iter_pdf_images(pdf_file.name, dpi=144, start_page=sub_indices[0], end_page=sub_indices[-1] + 1):
-                        sub_images.append(image)
-                        if '<image>' in prompt_template:
-                            image_features = DeepseekOCRProcessor().tokenize_with_images(
-                                images=[image], bos=True, eos=True, cropping=use_cropping
-                            )
-                        else:
-                            image_features = ''
-                        
-                        request = {
-                            "prompt": prompt_template,
-                            "multi_modal_data": {"image": image_features} if image_features else {}
-                        }
-                        batch_inputs.append(request)
-                    
-                    # Generate for the batch
-                    async def generate_batch():
-                        global engine
-                        if engine is None:
-                            await initialize_engine()
-                        
-                        logits_processors = [NoRepeatNGramLogitsProcessor(
-                            ngram_size=30, window_size=90, whitelist_token_ids={128821, 128822}
-                        )]
-                        
-                        sampling_params = SamplingParams(
-                            temperature=0.0,
-                            max_tokens=8192,
-                            logits_processors=logits_processors,
-                            skip_special_tokens=False,
-                        )
-                        
-                        results = []
-                        for request in batch_inputs:
-                            request_id = f"request-{os.urandom(16).hex()}"
-                            full_text = ""
-                            async for request_output in engine.generate(request, sampling_params, request_id):
-                                if request_output.outputs:
-                                    full_text = request_output.outputs[0].text
-                            results.append(full_text)
-                        return results
-                    
-                    batch_results = asyncio.run(generate_batch())
-                    
-                    # Process results
-                    for idx_offset, (result_text, global_idx) in enumerate(zip(batch_results, sub_indices)):
-                        matches_ref, matches_images, matches_other = re_match(result_text)
-                        clean_text = result_text
-                        for match in matches_images + matches_other:
-                            clean_text = clean_text.replace(match, '')
-                        clean_text = clean_text.replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
-                        
-                        all_results.append(f"--- Page {global_idx + 1} ---\n{clean_text}\n")
-                    # Help GC between chunks
-                    del sub_images, batch_inputs, batch_results
-                    import gc
-                    gc.collect()
-                        
-                except Exception as batch_error:
-                    for global_idx in sub_indices:
-                        error_msg = f"--- Page {global_idx + 1} ---\nError processing page: {str(batch_error)}\n"
-                        all_results.append(error_msg)
-                    print(f"Error on batch {i//effective_batch_size + 1}: {batch_error}")
-                    # Continue processing other batches
-            
-            progress(1.0, desc=get_text("complete", lang))
-            return [], "\n".join(all_results)
+        # Force chunking for stability - never process more than chunk_size pages without engine restart
+        file_paths = []
+        all_results = []
         
-        else:
-            # Batch into 25 pages and save to files
-            batch_size = 25
-            file_paths = []
+        # Calculate chunks based on chunk_size
+        chunks = []
+        for i in range(0, num_pages, chunk_size):
+            chunk_start = i
+            chunk_end = min(i + chunk_size, num_pages)
+            chunks.append((chunk_start, chunk_end))
+        
+        print(f"[PDF] Split into {len(chunks)} chunks: {chunks}")
+        processing_state['total_chunks'] = len(chunks)
+        
+        # Process each chunk with engine restart
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
+            processing_state['current_chunk'] = chunk_idx + 1
             
-            for i in range(0, num_pages, batch_size):
+            if pdf_processing_cancelled:
+                pdf_processing_cancelled = False
+                # Return completed files even if cancelled
+                if processing_state['completed_files']:
+                    cancel_msg = f"{get_text('cancelled', lang)}\n\n✓ {len(processing_state['completed_files'])} file(s) completed before cancellation."
+                    return processing_state['completed_files'], cancel_msg
+                return file_paths if file_paths else [], get_text("cancelled", lang)
+            
+            chunk_pages = chunk_end - chunk_start
+            print(f"[PDF] Processing chunk {chunk_idx + 1}/{len(chunks)}: pages {chunk_start + 1}-{chunk_end} ({chunk_pages} pages)")
+            
+            # Force engine restart before each chunk (except first)
+            if chunk_idx > 0:
+                print(f"[PDF] Restarting engine before chunk {chunk_idx + 1}")
+                try:
+                    asyncio.run(initialize_engine(force_restart=True))
+                    # Wait a moment for engine to stabilize
+                    import time
+                    time.sleep(3)
+                except Exception as restart_error:
+                    print(f"[PDF] Warning: Engine restart failed: {restart_error}")
+                    # Continue anyway - the processing logic will handle engine initialization
+            
+            chunk_results = []
+            chunk_progress_start = chunk_start / num_pages
+            chunk_progress_range = chunk_pages / num_pages
+            
+            # Process this chunk in smaller batches
+            effective_batch_size = max(1, min(batch_size, chunk_pages))
+            # Further limit batch size for very large chunks
+            if chunk_pages > 30:
+                effective_batch_size = min(effective_batch_size, 1)
+            elif chunk_pages > 15:
+                effective_batch_size = min(effective_batch_size, 2)
+            
+            for i in range(chunk_start, chunk_end, effective_batch_size):
                 if pdf_processing_cancelled:
                     pdf_processing_cancelled = False
-                    return [], get_text("cancelled", lang)
+                    return file_paths if file_paths else [], get_text("cancelled", lang)
                 
-                sub_indices = list(range(i, min(i + batch_size, num_pages)))
+                # Check system memory before processing
+                if not check_system_memory():
+                    error_msg = "⚠️ Critical system memory pressure detected. Stopping to prevent OOM kill.\n\n"
+                    if processing_state['completed_files']:
+                        error_msg += f"✓ {len(processing_state['completed_files'])} file(s) completed before stopping."
+                        return processing_state['completed_files'], error_msg
+                    else:
+                        return [], error_msg
                 
-                progress((i + len(sub_indices)) / num_pages, desc=f"{get_text('processing_page', lang)} {i + 1}-{min(i + batch_size, num_pages)}/{num_pages}...")
+                batch_start = i
+                batch_end = min(i + effective_batch_size, chunk_end)
+                batch_indices = list(range(batch_start, batch_end))
+                
+                batch_progress = chunk_progress_start + ((i - chunk_start) / chunk_pages) * chunk_progress_range
+                progress(batch_progress, desc=f"Chunk {chunk_idx + 1}/{len(chunks)}: {get_text('processing_page', lang)} {i + 1}-{batch_end}/{num_pages}...")
+                
+                # Check memory before processing batch
+                if not check_gpu_memory():
+                    print(f"[PDF] Skipping batch due to memory constraints")
+                    for global_idx in batch_indices:
+                        error_msg = f"# Page {global_idx + 1}\n\n**Skipped due to memory pressure**\n"
+                        chunk_results.append(error_msg)
+                    continue
                 
                 try:
-                    # Prepare batch inputs
+                    # Check memory pressure
+                    if memory_pressure['high_pressure_count'] >= 2:  # Reduced threshold
+                        print(f"[MEMORY] High memory pressure detected, skipping batch")
+                        for global_idx in batch_indices:
+                            error_msg = f"# Page {global_idx + 1}\n\n**Skipped due to memory pressure**\n"
+                            chunk_results.append(error_msg)
+                        # Clear memory and continue
+                        clear_gpu_memory()
+                        gc.collect()
+                        continue
+                    
+                    # Prepare batch inputs with lazy loading
                     batch_inputs = []
-                    # Lazily render only the pages in this chunk
-                    sub_images = []
-                    for page_idx, image in iter_pdf_images(pdf_file.name, dpi=144, start_page=sub_indices[0], end_page=sub_indices[-1] + 1):
-                        sub_images.append(image)
+                    batch_images = []
+                    
+                    print(f"[PDF] Loading pages {batch_start + 1}-{batch_end}...")
+                    for page_idx, image in iter_pdf_images(pdf_file.name, dpi=144, start_page=batch_start, end_page=batch_end):
+                        batch_images.append(image)
                         if '<image>' in prompt_template:
                             image_features = DeepseekOCRProcessor().tokenize_with_images(
                                 images=[image], bos=True, eos=True, cropping=use_cropping
@@ -652,71 +940,232 @@ def process_ocr_pdf(
                         }
                         batch_inputs.append(request)
                     
-                    # Generate for the batch
-                    async def generate_batch():
-                        global engine
-                        if engine is None:
-                            await initialize_engine()
+                    # Process batch with comprehensive error handling
+                    async def generate_batch_with_recovery():
+                        global engine, engine_health_status
                         
-                        logits_processors = [NoRepeatNGramLogitsProcessor(
-                            ngram_size=30, window_size=90, whitelist_token_ids={128821, 128822}
-                        )]
+                        # Ensure engine is healthy
+                        max_engine_retries = 2
+                        for engine_retry in range(max_engine_retries):
+                            try:
+                                if engine_health_status.get('requires_restart', False) or engine is None:
+                                    print(f"[ENGINE] Initializing engine (retry {engine_retry + 1})")
+                                    await initialize_engine(force_restart=True)
+                                
+                                logits_processors = [NoRepeatNGramLogitsProcessor(
+                                    ngram_size=30, window_size=90, whitelist_token_ids={128821, 128822}
+                                )]
+                                
+                                sampling_params = SamplingParams(
+                                    temperature=0.0,
+                                    max_tokens=1024,  # Conservative limit
+                                    logits_processors=logits_processors,
+                                    skip_special_tokens=False,
+                                )
+                                
+                                results = []
+                                for idx, request in enumerate(batch_inputs):
+                                    page_num = batch_indices[idx] + 1
+                                    request_id = f"request-{os.urandom(16).hex()}"
+                                    
+                                    # Try processing this page with retries
+                                    page_success = False
+                                    for page_retry in range(2):
+                                        try:
+                                            async def generate_single():
+                                                text = ""
+                                                async for request_output in engine.generate(request, sampling_params, request_id):
+                                                    if request_output.outputs:
+                                                        text = request_output.outputs[0].text
+                                                return text
+                                            
+                                            # Reduced timeout per page
+                                            page_text = await asyncio.wait_for(generate_single(), timeout=120)
+                                            results.append(page_text)
+                                            page_success = True
+                                            engine_health_status['consecutive_errors'] = 0
+                                            break
+                                            
+                                        except (asyncio.TimeoutError, Exception) as page_error:
+                                            error_type = type(page_error).__name__
+                                            error_str = str(page_error).lower()
+                                            print(f"[BATCH] Page {page_num} error (attempt {page_retry + 1}): {error_type}")
+                                            engine_health_status['consecutive_errors'] += 1
+                                            
+                                            # Track failed page
+                                            processing_state['failed_pages'].append({
+                                                'page': page_num,
+                                                'error': error_type,
+                                                'chunk': chunk_idx
+                                            })
+                                            
+                                            # Check if it's a critical error requiring immediate engine restart
+                                            is_critical = any(keyword in error_str for keyword in ['dead', 'asyncenginedead', 'killed', 'cuda']) or 'AsyncEngineDeadError' in error_type
+                                            
+                                            if is_critical and page_retry == 0:
+                                                # Critical error on first attempt - restart engine immediately
+                                                print(f"[ENGINE] Critical error detected, restarting engine immediately...")
+                                                engine_health_status['requires_restart'] = True
+                                                try:
+                                                    await initialize_engine(force_restart=True)
+                                                    await asyncio.sleep(2)
+                                                    # Retry this page with fresh engine
+                                                    continue
+                                                except Exception as restart_error:
+                                                    print(f"[ENGINE] Failed to restart engine: {restart_error}")
+                                                    results.append(f"Error processing page {page_num}: Engine restart failed")
+                                                    page_success = True  # Prevent further retries
+                                                    break
+                                            elif page_retry == 0:
+                                                # Non-critical error, wait and retry
+                                                await asyncio.sleep(1)
+                                            else:
+                                                # Final failure for this page
+                                                results.append(f"Error processing page {page_num}: {error_type}")
+                                                if is_critical:
+                                                    engine_health_status['requires_restart'] = True
+                                                    print(f"[ENGINE] Marking engine for restart due to: {error_type}")
+                                    
+                                    if not page_success:
+                                        print(f"[BATCH] Failed to process page {page_num} after retries")
+                                
+                                return results
+                                
+                            except Exception as engine_error:
+                                error_str = str(engine_error).lower()
+                                print(f"[ENGINE] Engine error (retry {engine_retry + 1}): {engine_error}")
+                                
+                                if engine_retry < max_engine_retries - 1:
+                                    print(f"[ENGINE] Attempting engine restart...")
+                                    engine_health_status['requires_restart'] = True
+                                    await asyncio.sleep(2)
+                                else:
+                                    # Final engine failure - return error messages but don't crash
+                                    print(f"[ENGINE] Engine failed after {max_engine_retries} retries")
+                                    return [f"Engine failure: {engine_error}" for _ in batch_inputs]
                         
-                        sampling_params = SamplingParams(
-                            temperature=0.0,
-                            max_tokens=8192,
-                            logits_processors=logits_processors,
-                            skip_special_tokens=False,
-                        )
-                        
-                        results = []
-                        for request in batch_inputs:
-                            request_id = f"request-{os.urandom(16).hex()}"
-                            full_text = ""
-                            async for request_output in engine.generate(request, sampling_params, request_id):
-                                if request_output.outputs:
-                                    full_text = request_output.outputs[0].text
-                            results.append(full_text)
-                        return results
+                        return [f"Engine initialization failed" for _ in batch_inputs]
                     
-                    batch_results = asyncio.run(generate_batch())
+                    # Execute batch processing with error protection
+                    print(f"[PDF] Processing batch of {len(batch_inputs)} pages...")
+                    try:
+                        batch_results = asyncio.run(generate_batch_with_recovery())
+                    except Exception as async_error:
+                        print(f"[PDF] Async execution error: {async_error}")
+                        # Create error entries for all pages in batch
+                        batch_results = [f"Async error: {async_error}" for _ in batch_inputs]
                     
-                    # Process results
-                    batch_texts = []
-                    for idx_offset, (result_text, global_idx) in enumerate(zip(batch_results, sub_indices)):
-                        matches_ref, matches_images, matches_other = re_match(result_text)
-                        clean_text = result_text
-                        for match in matches_images + matches_other:
-                            clean_text = clean_text.replace(match, '')
-                        clean_text = clean_text.replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
-                        
-                        batch_texts.append(f"--- Page {global_idx + 1} ---\n{clean_text}\n")
+                    # Process and store results
+                    for idx, result_text in enumerate(batch_results):
+                        global_idx = batch_indices[idx]
+                        clean_text = format_as_markdown(result_text, page_num=global_idx + 1, doc_title=base_name)
+                        chunk_results.append(clean_text + "\n")
                     
-                    # Save to file
-                    file_path = f"output/{base_name}_{i//batch_size + 1:03d}.md"
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write("\n\n".join(batch_texts))
-                    file_paths.append(file_path)
-                    # Help GC between chunks
-                    del sub_images, batch_inputs, batch_results, batch_texts
-                    import gc
+                    # Cleanup after batch
+                    del batch_images, batch_inputs, batch_results
+                    clear_gpu_memory()
                     gc.collect()
                     
                 except Exception as batch_error:
-                    error_file_path = f"output/{base_name}_{i//batch_size + 1:03d}.md"
-                    error_content = "\n\n".join([f"--- Page {global_idx + 1} ---\nError processing page: {str(batch_error)}\n" for global_idx in sub_indices])
-                    with open(error_file_path, 'w', encoding='utf-8') as f:
-                        f.write(error_content)
-                    file_paths.append(error_file_path)
-                    print(f"Error on batch {i//batch_size + 1}: {batch_error}")
-                    # Continue processing other batches
+                    error_str = str(batch_error)
+                    print(f"[PDF] Batch error: {batch_error}")
+                    import traceback
+                    traceback.print_exc()
+                    
+                    # Create error entries for failed pages
+                    for global_idx in batch_indices:
+                        error_msg = f"# Page {global_idx + 1}\n\n**Error processing page:** {str(batch_error)}\n"
+                        chunk_results.append(error_msg)
+                        processing_state['failed_pages'].append({
+                            'page': global_idx + 1,
+                            'error': str(batch_error),
+                            'chunk': chunk_idx
+                        })
+                    
+                    # Cleanup and continue
+                    clear_gpu_memory()
+                    gc.collect()
+                    import time
+                    time.sleep(2)
             
-            progress(1.0, desc=get_text("complete", lang))
-            return file_paths, ""
+            # Save chunk results immediately (even if incomplete)
+            if chunk_results:
+                try:
+                    if len(chunks) == 1:
+                        # Single chunk - return as text
+                        all_results.extend(chunk_results)
+                    else:
+                        # Multiple chunks - save to files
+                        chunk_file_path = f"output/{base_name}_chunk_{chunk_idx + 1:03d}.md"
+                        chunk_content = "\n\n".join(chunk_results)
+                        with open(chunk_file_path, 'w', encoding='utf-8') as f:
+                            f.write(chunk_content)
+                        file_paths.append(chunk_file_path)
+                        processing_state['completed_files'].append(chunk_file_path)
+                        print(f"[PDF] Saved chunk {chunk_idx + 1} to {chunk_file_path}")
+                except Exception as save_error:
+                    print(f"[PDF] Error saving chunk {chunk_idx + 1}: {save_error}")
+                    # Continue processing even if save fails
+            
+            # Progress update for chunk completion
+            chunk_progress_end = chunk_progress_start + chunk_progress_range
+            progress(chunk_progress_end, desc=f"Completed chunk {chunk_idx + 1}/{len(chunks)}")
+            
+            # Memory cleanup between chunks
+            clear_gpu_memory()
+            gc.collect()
+            import time
+            time.sleep(1)
+        
+        progress(1.0, desc=get_text("complete", lang))
+        
+        # Build summary message
+        summary_parts = []
+        if processing_state['failed_pages']:
+            failed_count = len(processing_state['failed_pages'])
+            summary_parts.append(f"⚠️ {failed_count} page(s) failed to process")
+            # List failed pages
+            failed_list = ", ".join([str(p['page']) for p in processing_state['failed_pages'][:10]])
+            if failed_count > 10:
+                failed_list += "..."
+            summary_parts.append(f"Failed pages: {failed_list}")
+        
+        if file_paths:
+            summary_parts.append(f"✓ Generated {len(file_paths)} file(s)")
+        
+        summary_msg = "\n\n".join(summary_parts) if summary_parts else ""
+        
+        # Return results based on processing mode
+        if len(chunks) == 1:
+            # Single chunk - return combined text with summary
+            combined_text = "\n".join(all_results)
+            if summary_msg:
+                combined_text = f"{summary_msg}\n\n---\n\n{combined_text}"
+            return [], combined_text
+        else:
+            # Multiple chunks - return file paths
+            return file_paths, summary_msg
         
     except Exception as e:
         progress(1.0, desc="Error occurred")
-        return [], f"{get_text('error_pdf', lang)} {str(e)}"
+        error_msg = f"{get_text('error_pdf', lang)} {str(e)}"
+        print(f"[PDF] Critical error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Return any completed files even on error
+        if processing_state.get('completed_files'):
+            completed_files = processing_state['completed_files']
+            error_msg += f"\n\n⚠️ Partial results available ({len(completed_files)} file(s) completed before error)"
+            print(f"[PDF] Returning {len(completed_files)} completed files despite error")
+            return completed_files, error_msg
+        
+        return [], error_msg
+    finally:
+        # Reset processing state
+        processing_state['processing_active'] = False
+        processing_state['current_chunk'] = 0
+        processing_state['total_chunks'] = 0
 
 
 def load_file_content(file_path):
@@ -757,16 +1206,16 @@ def create_gradio_app():
         "en": {
             "Document to Markdown": "<image>\n<|grounding|>Convert the document to markdown.",
             "OCR with Grounding": "<image>\n<|grounding|>OCR this image.",
-            "Free OCR": "<image>\nFree OCR.",
+            "Free OCR": "<image>\nPlain text OCR.",
             "Parse Figure": "<image>\nParse the figure.",
             "Describe Image": "<image>\nDescribe this image in detail.",
         },
         "zh": {
             "文档转Markdown": "<image>\n<|grounding|>将文档转换为markdown。",
-            "OCR（带定位）": "<image>\n<|grounding|>OCR 此图像。要求必须使用中文。",
-            "自由OCR": "<image>\n自由 OCR,要求必须使用中文。",
-            "解析图表": "<image>\n用中文解析图表。要求必须使用中文.",
-            "描述图片": "<image>\n用中文详细描述此图像。要求必须使用中文描述图像。",
+            "OCR（带定位）": "<image>\n<|grounding|>OCR 此图像。",
+            "自由OCR": "<image>\n纯文本OCR。必须使用中文。",
+            "解析图表": "<image>\n解析图表。必须使用中文。",
+            "描述图片": "<image>\n详细描述此图像。必须使用中文。",
         }
     }
     
@@ -968,18 +1417,26 @@ def create_gradio_app():
                         
                         max_pages = gr.Slider(
                             minimum=0,
-                            maximum=50,
-                            value=0,
+                            maximum=100,
+                            value=40,
                             step=1,
-                            label=get_text("max_pages", "zh")
+                            label=get_text("max_pages", "zh") + " (建议≤40页/chunk)"
                         )
                         
                         batch_size = gr.Slider(
                             minimum=1,
-                            maximum=10,
+                            maximum=5,
                             value=1,
                             step=1,
-                            label="Batch Size (pages per batch)"
+                            label="Batch Size (pages per batch, 建议1-2)"
+                        )
+                        
+                        chunk_size = gr.Slider(
+                            minimum=20,
+                            maximum=60,
+                            value=40,
+                            step=10,
+                            label="Chunk Size (pages per processing session, 建议30-40)"
                         )
                         
                         with gr.Row():
@@ -1007,28 +1464,68 @@ def create_gradio_app():
                 # State to store file paths
                 file_paths_state = gr.State(value=[])
                 
-                def process_pdf_wrapper(pdf_file, prompt, crop, max_p, batch_s, lang, progress=gr.Progress()):
-                    file_paths, content = process_ocr_pdf(pdf_file, prompt, crop, max_p, batch_s, lang, progress)
-                    if file_paths:
-                        zip_path = create_zip_of_files(file_paths)
-                        return (
-                            gr.update(choices=file_paths, value=file_paths[0], visible=True),
-                            gr.update(value=zip_path, visible=True),
-                            load_file_content(file_paths[0]),
-                            file_paths
-                        )
-                    else:
+                def process_pdf_wrapper(pdf_file, prompt, crop, max_p, batch_s, chunk_s, lang, progress=gr.Progress()):
+                    try:
+                        file_paths, content = process_ocr_pdf(pdf_file, prompt, crop, max_p, batch_s, chunk_s, lang, progress)
+                        
+                        if file_paths:
+                            # Multiple chunks - create zip file
+                            try:
+                                zip_path = create_zip_of_files(file_paths)
+                            except Exception as zip_error:
+                                print(f"[PDF] Error creating zip: {zip_error}")
+                                zip_path = None
+                            
+                            return (
+                                gr.update(choices=file_paths, value=file_paths[0] if file_paths else None, visible=True),
+                                gr.update(value=zip_path, visible=True if zip_path else False),
+                                load_file_content(file_paths[0]) if file_paths else content,
+                                file_paths
+                            )
+                        elif content:
+                            # Single chunk - create a single markdown file for download
+                            if pdf_file:
+                                try:
+                                    base_name = os.path.splitext(os.path.basename(pdf_file.name))[0]
+                                    single_file_path = f"output/{base_name}_complete.md"
+                                    with open(single_file_path, 'w', encoding='utf-8') as f:
+                                        f.write(content)
+                                    return (
+                                        gr.update(choices=[single_file_path], value=single_file_path, visible=True),
+                                        gr.update(value=single_file_path, visible=True),
+                                        content,
+                                        [single_file_path]
+                                    )
+                                except Exception as save_error:
+                                    print(f"[PDF] Error saving file: {save_error}")
+                                    return (
+                                        gr.update(choices=[], visible=False),
+                                        gr.update(visible=False),
+                                        content,
+                                        []
+                                    )
                         return (
                             gr.update(choices=[], visible=False),
                             gr.update(visible=False),
-                            content,
+                            content if content else "No content generated",
+                            []
+                        )
+                    except Exception as wrapper_error:
+                        print(f"[PDF] Wrapper error: {wrapper_error}")
+                        import traceback
+                        traceback.print_exc()
+                        error_msg = f"❌ Processing error: {str(wrapper_error)}\n\nThe application will continue running. Please try again with smaller settings."
+                        return (
+                            gr.update(choices=[], visible=False),
+                            gr.update(visible=False),
+                            error_msg,
                             []
                         )
                 
                 # Process PDF button
                 pdf_process_btn.click(
                     fn=process_pdf_wrapper,
-                    inputs=[pdf_input, pdf_custom_prompt, pdf_use_cropping, max_pages, batch_size, lang_selector],
+                    inputs=[pdf_input, pdf_custom_prompt, pdf_use_cropping, max_pages, batch_size, chunk_size, lang_selector],
                     outputs=[file_selector, download_btn, pdf_output, file_paths_state],
                     show_progress="full"
                 )
@@ -1090,8 +1587,9 @@ def create_gradio_app():
                 gr.Dropdown(choices=prompt_choices, value=prompt_choices[0], label=get_text("select_prompt", lang)),
                 gr.Textbox(value=default_prompt, label=get_text("custom_prompt", lang), lines=2),
                 gr.Checkbox(value=CROP_MODE, label=get_text("enable_cropping", lang)),
-                gr.Slider(minimum=0, maximum=50, value=0, step=1, label=get_text("max_pages", lang)),
-                gr.Slider(minimum=1, maximum=10, value=1, step=1, label="Batch Size (pages per batch)"),
+                gr.Slider(minimum=0, maximum=100, value=50, step=1, label=get_text("max_pages", lang) + " (建议≤40页/chunk)"),
+                gr.Slider(minimum=1, maximum=5, value=1, step=1, label="Batch Size (pages per batch, 建议1)"),
+                gr.Slider(minimum=20, maximum=60, value=40, step=10, label="Chunk Size (pages per processing session, 建议30-40)"),
                 gr.Button(get_text("process_pdf", lang), variant="primary"),
                 gr.Button(get_text("cancel_pdf", lang), variant="stop"),
                 gr.Dropdown(choices=[], label=get_text("select_markdown_file", lang), visible=False),
@@ -1112,7 +1610,7 @@ def create_gradio_app():
                 title_md, image_tab, pdf_tab, about_tab,
                 prompt_dropdown, custom_prompt, use_cropping, show_boxes, process_btn,
                 output_image, output_text, raw_output_accordion, raw_output,
-                pdf_input, pdf_prompt_dropdown, pdf_custom_prompt, pdf_use_cropping, max_pages, batch_size,
+                pdf_input, pdf_prompt_dropdown, pdf_custom_prompt, pdf_use_cropping, max_pages, batch_size, chunk_size,
                 pdf_process_btn, pdf_cancel_btn, file_selector, download_btn, pdf_output, about_md
             ]
         )
@@ -1129,11 +1627,41 @@ if __name__ == "__main__":
     # Initialize the engine in the background
     print("\nStarting engine initialization...")
     
+    # Get port from environment variable or use default
+    server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+    
     app = create_gradio_app()
     app.queue()
-    app.launch(
-        server_name="localhost",
-        server_port=7860,
-        share=False,
-        show_error=True
-    )
+    
+    # Try to launch with flexible port selection
+    try:
+        app.launch(
+            server_name="localhost",
+            server_port=server_port,
+            share=False,
+            show_error=True
+        )
+    except OSError as e:
+        if "Cannot find empty port" in str(e):
+            print(f"Port {server_port} is busy, trying alternative ports...")
+            # Try ports 7861-7870
+            for port in range(7861, 7871):
+                try:
+                    print(f"Trying port {port}...")
+                    app.launch(
+                        server_name="localhost",
+                        server_port=port,
+                        share=False,
+                        show_error=True
+                    )
+                    break
+                except OSError:
+                    continue
+            else:
+                print("ERROR: Could not find any available port in range 7860-7870")
+                print("Please manually kill any existing gradio processes:")
+                print("  pkill -f gradio_app.py")
+                print("  pkill -f 'python.*gradio'")
+                exit(1)
+        else:
+            raise

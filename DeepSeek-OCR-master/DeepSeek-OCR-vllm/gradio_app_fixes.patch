@@ -1,0 +1,87 @@
+--- gradio_app.py.orig	2025-10-23 19:00:00.000000000 +0000
++++ gradio_app.py	2025-10-23 19:30:00.000000000 +0000
+@@ -595,7 +595,7 @@
+                        
+                        sampling_params = SamplingParams(
+                            temperature=0.0,
+-                            max_tokens=8192,
++                            max_tokens=1536,  # Reduced for PDF processing to prevent timeouts
+                            logits_processors=logits_processors,
+                            skip_special_tokens=False,
+                        )
+@@ -603,9 +603,22 @@
+                        results = []
+                        for request in batch_inputs:
+                            request_id = f"request-{os.urandom(16).hex()}"
+-                            full_text = ""
+-                            async for request_output in engine.generate(request, sampling_params, request_id):
+-                                if request_output.outputs:
+-                                    full_text = request_output.outputs[0].text
++                            
++                            # Add timeout for each request in batch
++                            async def generate_single():
++                                async for request_output in engine.generate(request, sampling_params, request_id):
++                                    if request_output.outputs:
++                                        return request_output.outputs[0].text
++                                return ""
++                            
++                            try:
++                                full_text = await asyncio.wait_for(generate_single(), timeout=120)  # 2 min per page
++                            except asyncio.TimeoutError:
++                                full_text = "[TIMEOUT] Page processing timed out"
++                            
+                            results.append(full_text)
++                            
++                            # Force cleanup after each page
++                            import gc
++                            gc.collect()
+                        return results
+@@ -627,8 +640,8 @@
+             return [], "\n".join(all_results)
+         
+         else:
+-            # Batch into 25 pages and save to files
+-            batch_size = 25
++            # Batch into 10 pages and save to files (reduced from 25)
++            batch_size = 10
+             file_paths = []
+             
+             for i in range(0, num_pages, batch_size):
+@@ -682,7 +695,7 @@
+                        
+                        sampling_params = SamplingParams(
+                            temperature=0.0,
+-                            max_tokens=8192,
++                            max_tokens=1536,  # Reduced for large PDF processing
+                            logits_processors=logits_processors,
+                            skip_special_tokens=False,
+                        )
+@@ -690,13 +703,26 @@
+                        results = []
+                        for request in batch_inputs:
+                            request_id = f"request-{os.urandom(16).hex()}"
+-                            full_text = ""
+-                            async for request_output in engine.generate(request, sampling_params, request_id):
+-                                if request_output.outputs:
+-                                    full_text = request_output.outputs[0].text
++                            
++                            # Add timeout for each request in batch
++                            async def generate_single():
++                                async for request_output in engine.generate(request, sampling_params, request_id):
++                                    if request_output.outputs:
++                                        return request_output.outputs[0].text
++                                return ""
++                            
++                            try:
++                                full_text = await asyncio.wait_for(generate_single(), timeout=120)  # 2 min per page
++                            except asyncio.TimeoutError:
++                                full_text = "[TIMEOUT] Page processing timed out"
++                            
+                            results.append(full_text)
++                            
++                            # Force cleanup after each page
++                            import gc
++                            gc.collect()
+                        return results
+                    
+                    batch_results = asyncio.run(generate_batch())

@@ -27,14 +27,15 @@ OUTPUT_PATH = ''
 PROMPT = '<image>\n<|grounding|>Convert the document to markdown.'
 # PROMPT = '<image>\nFree OCR.'
 # TODO commonly used prompts
-# document: <image>\n<|grounding|>Convert the document to markdown.
-# other image: <image>\n<|grounding|>OCR this image.
-# without layouts: <image>\nFree OCR.
-# figures in document: <image>\nParse the figure.
-# general: <image>\nDescribe this image in detail.
-# rec: <image>\nLocate <|ref|>xxxx<|/ref|> in the image.
-# '先天下之忧而忧'
-# .......
+# document_to_markdown: <image>\n<|grounding|>Convert the document to markdown.
+# ocr_with_grounding: <image>\n<|grounding|>OCR this image.
+# plain_text_ocr: <image>\nFree OCR.
+# figure_parsing: <image>\nParse the figure.
+# image_description: <image>\nDescribe this image in detail.
+# text_localization: <image>\nLocate text in the image.
+# object_localization: <image>\nLocate <|ref|>{target}<|/ref|> in the image.
+# Chinese: add '必须使用中文' to enforce Chinese output
+# Example: <image>\n<|grounding|>将文档转换为markdown。必须使用中文。
 
 
 from transformers import AutoTokenizer

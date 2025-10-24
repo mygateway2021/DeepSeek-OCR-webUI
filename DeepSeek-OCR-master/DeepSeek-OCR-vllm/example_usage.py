@@ -119,9 +119,10 @@ async def custom_prompt_example(image_path: str):
     """
     prompts = {
         "Markdown": "<image>\n<|grounding|>Convert the document to markdown.",
+        "OCR with Grounding": "<image>\n<|grounding|>OCR this image.",
         "Free OCR": "<image>\nFree OCR.",
-        "Describe": "<image>\nDescribe this image in detail.",
         "Parse Figure": "<image>\nParse the figure.",
+        "Describe": "<image>\nDescribe this image in detail.",
     }
     
     # Initialize engine
